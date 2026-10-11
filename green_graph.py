@@ -72,13 +72,22 @@ def fetch_repos(token):
     while True:
         stdout, stderr, rc = run(
             f'curl -s -H "Authorization: token {token}" '
-            f'"https://api.github.com/user/repos?per_page=100&page={type}&type=all"'
+            f'"https://api.github.com/user/repos?per_page=100&page={page}&type=all"'
         )
         if rc != 0:
             print(f"  Failed to fetch repos: {stderr}")
             break
-        data = json.loads(stdout) if stdout else []
-        if not data or not isinstance(data, list):
+        try:
+            data = json.loads(stdout) if stdout else []
+        except json.JSONDecodeError:
+            print(f"  Failed to parse GitHub response: {stdout[:120]}")
+            break
+        if not isinstance(data, list):
+            # GitHub returns a dict like {"message": "Bad credentials"} on error.
+            msg = data.get("message", "unexpected response") if isinstance(data, dict) else data
+            print(f"  GitHub API error: {msg}")
+            break
+        if not data:
             break
         for r in data:
             repos.append({
@@ -107,11 +116,11 @@ def calculate_active_days(start_date, end_date, coverage=0.78, seed=42):
 
 
 # ─── Get existing commit dates from a local repo ────────────────────────────
-def get_existing_dates(repo_dir):
-    """Read all commit dates from a cloned repo since 2025-06-01."""
+def get_existing_dates(repo_dir, since="2025-06-01"):
+    """Read all commit dates from a cloned repo since `since`."""
     dates = set()
     stdout, _, _ = run(
-        "git log --format='%ai' --since='2025-06-01'", cwd=repo_dir, timeout=30
+        f"git log --format='%ai' --since='{since}'", cwd=repo_dir, timeout=30
     )
     for line in stdout.splitlines():
         try:
@@ -123,7 +132,8 @@ def get_existing_dates(repo_dir):
 
 
 # ─── Create backdated commits and push ──────────────────────────────────────
-def process_repo(repo_name, token, repo_days, messages, user_name, user_email):
+def process_repo(repo_name, token, repo_days, messages, user_name, user_email,
+                 since="2025-06-01"):
     """Clone a repo, create empty commits with backdated dates, and push."""
     repo_url = f"https://{token}@github.com/{repo_name}.git"
     repo_dir = f"/tmp/green-graph/{repo_name.replace('/', '_')}"
@@ -145,7 +155,7 @@ def process_repo(repo_name, token, repo_days, messages, user_name, user_email):
         os.remove(lock_file)
 
     # Check existing dates
-    existing = get_existing_dates(repo_dir)
+    existing = get_existing_dates(repo_dir, since)
     days_to_do = [d for d in repo_days if d not in existing]
 
     if not days_to_do:
@@ -226,6 +236,14 @@ Examples:
 
     start_date = datetime.date.fromisoformat(args.start)
     end_date = datetime.date.fromisoformat(args.end) if args.end else datetime.date.today()
+
+    if not 0.0 <= args.coverage <= 1.0:
+        print("❌ --coverage must be between 0.0 and 1.0")
+        sys.exit(1)
+    if end_date < start_date:
+        print(f"❌ --end ({end_date}) is before --start ({start_date})")
+        sys.exit(1)
+
     messages = args.messages if args.messages else DEFAULT_MESSAGES
 
     print("🟢 GitHub Green Graph")
@@ -275,7 +293,8 @@ Examples:
             continue
 
         commits = process_repo(
-            repo_name, args.token, repo_days, messages, args.name, args.email
+            repo_name, args.token, repo_days, messages, args.name, args.email,
+            args.start,
         )
         total_commits += commits
         covered_days.update(repo_days[:commits])
